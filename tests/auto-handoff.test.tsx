@@ -5,7 +5,7 @@ import { briefPrompt, extractFacts, factsBlock, hasUnansweredLastRequest, isVali
 import { renderTemplate } from '../hooks/templates.ts'
 import { parseBrief } from '../hooks/viewer.ts'
 
-type Calls = { compacts: number; steps: number; cleared: number; seeded: string[]; written: Record<string, string>; completes: number; tokens: number; prompts: string[]; toasts: string[]; ran: number }
+type Calls = { compacts: number; steps: number; cleared: number; seeded: string[]; written: Record<string, string>; completes: number; tokens: number; prompts: string[]; toasts: string[]; ran: number; release: () => void }
 
 // The test runs sandboxed, with no file access, so these stand in for the files in templates/:
 // the same headings and switches, shorter prose.
@@ -56,8 +56,8 @@ const posix = (p: string) => p.replace(/^[A-Za-z]:/, '').replace(/\\/g, '/')
 const files = (written: Record<string, string>) => Object.keys(written).filter(p => !p.endsWith('/auto-handoff.log'))
 
 // The engine beneath the plugin: everything the mod calls, answered from memory.
-function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean; clear?: 'hang' }): Calls {
-  const calls: Calls = { compacts: 0, steps: 0, cleared: 0, seeded: [], written: {}, completes: 0, tokens: opts.tokens, prompts: [], toasts: [], ran: 0 }
+function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean; clear?: 'hang' | 'held' }): Calls {
+  const calls: Calls = { compacts: 0, steps: 0, cleared: 0, seeded: [], written: {}, completes: 0, tokens: opts.tokens, prompts: [], toasts: [], ran: 0, release: () => {} }
   let sessionId = 'old-session'
   let clears = 0
   mock.env(on, { HOME: '/home/test', ...(opts.env ?? {}) })
@@ -115,10 +115,13 @@ function engine(on: On, opts: { tokens: number; files?: Record<string, string>; 
     calls.toasts.push(e.text)
     return { value: undefined }
   })
+  // As the engine does: $.command.run resolves once the /clear ran, the process already under the
+  // fresh session's id. clear: 'hang' — the /clear never runs and never settles; the session stays
+  // as it is. clear: 'held' — it runs when the test calls calls.release().
   on('command.run', async () => {
     calls.cleared++
-    // clear: 'hang' — the /clear never runs and never settles; the session stays as it is.
     if (opts.clear === 'hang') return new Promise<never>(() => {})
+    if (opts.clear === 'held') await new Promise<void>(r => { calls.release = r })
     sessionId = `new-session-${++clears}`
     return {}
   })
@@ -209,6 +212,35 @@ describe('auto-handoff', () => {
     expect(calls.seeded[0]).toContain('Read the brief at /home/test/.claude/state/auto-handoff/old-session.md')
     expect(calls.seeded[0]).not.toContain('Finish the parser refactor')
     expect(calls.seeded[0]?.split('\n').length).toBe(1)
+  })
+
+  // Seen live 2026-10-10, seven handoffs in a row: "brief written … queueing /clear", the /clear ran,
+  // and no "seeding" line followed. The engine (2.1.296) never delivers classic.SessionStart to a
+  // user-tier plugin ("classic.SessionStart bypassed by cc-plugin-sec-default (tier user)"), so the
+  // seed must not wait for one: no $.classic.SessionStart is raised in this test.
+  test('the fresh session is seeded once its /clear resolves, with no SessionStart reaching the mod', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000 })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    expect(calls.cleared).toBe(1)
+    expect(calls.seeded.length).toBe(1)
+    expect(calls.seeded[0]).toContain('Read the brief at /home/test/.claude/state/auto-handoff/old-session.md')
+    expect(calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? '').toContain('seeding new=new-session-1 from=old-session')
+    expect(parseBrief(calls.written['/home/test/.claude/state/auto-handoff/old-session.md'] ?? '').header.to).toBe('new-session-1')
+    // The lock is gone with the seed: the fresh session's tool calls run.
+    calls.tokens = 47_000
+    const call = await $.tool.call({ tool: 'Read', file_path: '/a.txt' })
+    expect('deny' in call).toBe(false)
+  })
+
+  test('a SessionStart after the seed, on an engine that delivers one, neither seeds again nor drops the panel', async ($, on) => {
+    const calls = engine(on, { tokens: 165_000 })
+    await $.turn.complete(TURN)
+    await settle(() => calls.seeded.length > 0)
+    await $.classic.SessionStart({ source: 'clear' })
+    await settle(() => false)
+    expect(calls.seeded.length).toBe(1)
+    expect(await band($)).toContain('starting the fresh session')
   })
 
   test('fires once per session', async ($, on) => {
@@ -681,7 +713,7 @@ describe('auto-handoff', () => {
   })
 
   test('the panel above the prompt walks the handoff, then collapses', async ($, on) => {
-    const calls = engine(on, { tokens: 165_000, stepUsage: true })
+    const calls = engine(on, { tokens: 165_000, stepUsage: true, clear: 'held' })
     expect(await band($)).toBe('')
     await $.turn.complete(TURN)
     await settle(() => calls.cleared > 0)
@@ -692,7 +724,7 @@ describe('auto-handoff', () => {
     await clock.advance(100)
     expect(await band($)).not.toBe(clearing) // the spinner moved
 
-    await $.classic.SessionStart({ source: 'clear' })
+    calls.release() // the /clear runs
     await settle(() => calls.seeded.length > 0)
     expect(await band($)).toContain('✓ cleared')
     expect(await band($)).toContain('starting the fresh session')
@@ -777,6 +809,37 @@ describe('auto-handoff', () => {
     expect(calls.seeded.length).toBe(1)
     expect(calls.seeded[0]).toContain('Read the brief at /home/test/.claude/state/auto-handoff/old-session.md')
     expect(calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? '').toContain('late clear session=old-session')
+  })
+
+  test('a /clear that resolves after its lock was released still seeds, with no SessionStart', { timeoutMs: 30_000 }, async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'held' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.cleared > 0)
+    calls.tokens = 50_000
+    await clock.advance(121_000)
+    await $.tool.call({ tool: 'Read', file_path: '/a.txt' }) // releases the stuck lock
+    expect(calls.ran).toBe(1)
+    expect(calls.seeded.length).toBe(0)
+
+    calls.release() // the queued /clear runs after all
+    await settle(() => calls.seeded.length > 0)
+    expect(calls.seeded.length).toBe(1)
+    expect(calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? '').toContain('late clear session=old-session')
+  })
+
+  test('a /clear that resolves long after the release seeds nothing', { timeoutMs: 60_000 }, async ($, on) => {
+    const calls = engine(on, { tokens: 165_000, clear: 'held' })
+    await $.turn.complete(TURN)
+    await settle(() => calls.cleared > 0)
+    calls.tokens = 50_000
+    await clock.advance(121_000)
+    await $.tool.call({ tool: 'Read', file_path: '/a.txt' }) // releases the stuck lock
+    await clock.advance(121_000) // past the late window
+
+    calls.release()
+    await settle(() => false)
+    expect(calls.seeded.length).toBe(0)
+    expect(calls.written['/home/test/.claude/state/auto-handoff/auto-handoff.log'] ?? '').toContain('clear after the late window session=old-session')
   })
 
   test('a /clear long after the release is the person\'s own and starts empty', { timeoutMs: 60_000 }, async ($, on) => {

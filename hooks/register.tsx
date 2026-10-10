@@ -30,17 +30,23 @@ type Pending = { oldSession: string; briefPath: string; tokens: number; chain: s
 let pending: Pending | undefined
 let inFlight = false
 // While inFlight or pending, every tool call is refused. Both were released only by the handoff
-// itself: inFlight by handoff()'s finally, pending by the SessionStart of the /clear. Seen live
-// 2026-10-09: the /clear never reached SessionStart, pending stayed set for the life of the process,
-// and every tool call after that was refused. lock records when and for which session the handoff
-// began, so a handoff that does not finish releases the lock on its own (releaseIfStuck).
+// itself: inFlight by handoff()'s finally, pending by the seed after the /clear (seedAfterClear).
+// Seen live 2026-10-09: no seed came, pending stayed set for the life of the process, and every
+// tool call after that was refused. lock records when and for which session the handoff began, so a
+// handoff that does not finish releases the lock on its own (releaseIfStuck).
+//
+// The seed hangs on the /clear's own promise, not on SessionStart. Measured 2026-10-10 on 2.1.296
+// with --debug: "<plugin>: classic.SessionStart bypassed by cc-plugin-sec-default (tier user);
+// beneath runs". A built-in module skips every user-tier plugin's classic.SessionStart and
+// classic.SessionEnd hook, for a plugin's /clear and a typed one alike, while the settings hooks
+// beneath still run. Seven handoffs on one host wrote a brief and ran /clear; none was ever seeded.
 let lock: { session: string; since: number } | undefined
 // Bumped when a stuck handoff is released: a handoff() that wakes up afterwards must not touch
 // pending, inFlight or the panel again, in its success path and in its failure paths alike.
 let run = 0
 // The pending handoff a release dropped while its /clear was already queued. That /clear can still
-// run; its SessionStart then seeds from here instead of leaving a fresh session with no brief.
-// SessionStart cannot tell that /clear from the person's own, so the claim is bounded: it holds for
+// run; its seed then comes from here instead of leaving a fresh session with no brief.
+// A SessionStart cannot tell that /clear from the person's own, so the claim is bounded: it holds for
 // STUCK_MS after the release, and a new handoff drops it. A later /clear starts empty, as it should.
 let expired: Pending | undefined
 let expiredAt = 0
@@ -300,7 +306,9 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
       await log($, `handoff abandoned session=${sessionId}: released before its /clear was queued; brief at ${briefPath}, no clear`)
       return
     }
-    $.command.run({ command: 'clear' }).catch(async (err: unknown) => {
+    // Resolves once the /clear ran and the process is under the fresh session's id: the seed goes
+    // in from here, since no classic.SessionStart reaches this module (see the note at `pending`).
+    $.command.run({ command: 'clear' }).then(() => seedAfterClear($, sessionId), async (err: unknown) => {
       await log($, `clear rejected ${String(err)}`)
       // A run released as stuck no longer owns pending: a newer handoff may hold it. Its /clear
       // will not come now, so nothing is left for a late SessionStart to seed.
@@ -318,6 +326,68 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     pending = undefined
     // fired stays 'briefing', which tryHandoff treats as an orphan: the next turn tries again.
     failed($, 'no brief written', 'this session keeps going and tries again after the next turn')
+  }
+}
+
+// Seeds the fresh session from the handoff p: the lineage, the old brief's forward link, and the
+// one-line prompt that points the new session at the brief. Consumes pending and expired.
+async function seed($: EngineInterface, p: Pending) {
+  pending = undefined
+  expired = undefined
+  try {
+    const newSession = await $.session.id()
+    seededSession = newSession
+    floor = undefined
+    unmeasured = 0
+    await $.store.set(`fired:${p.oldSession}`, `seeded:${newSession}`)
+    await log($, `seeding new=${newSession} from=${p.oldSession}`)
+    handedFrom = { session: p.oldSession, tokens: p.tokens, link: p.link, problem: p.problem }
+    steps($, [briefStep(p.problem), { mark: 'done', text: 'cleared' }, { mark: 'spin', text: 'starting the fresh session' }])
+    const own = await storedLineage($, p.oldSession)
+    const prior = own ? own.depth : 1
+    lineage = { from: p.oldSession, chain: p.chain, depth: prior !== undefined ? prior + 1 : undefined }
+    await $.store.set(`lineage:${newSession}`, lineage)
+    // The old brief learns where it went, and its chain's pages link forward.
+    try {
+      const old = parseBrief(await $.fs.read(p.briefPath) as string)
+      // viewer: the page link, read by the status line script for the session it handed off to.
+      await $.fs.write(p.briefPath, withHeader({ ...old.header, to: newSession, ...(p.link ? { viewer: p.link } : {}) }, old.body))
+      const briefDir = p.briefPath.replace(/\/[^/]+$/, '')
+      await viewer($, briefDir, `${briefDir}/pages`, p.oldSession)
+    } catch (err) {
+      await log($, `viewer forward link failed ${String(err)}`)
+    }
+    // One line on screen; the model reads the brief from disk. A full brief as the
+    // seed showed up as a wall of text the person never wrote.
+    const text = `${SEED_PREFIX} ${short(p.oldSession)}. The previous session hit its context limit and was cleared. Read the brief at ${p.briefPath} before doing anything else${p.link ? ` (readable copy: ${p.link})` : ''} and follow its Instructions section. Open your first reply with the line "↪ Handoff from session ${short(p.oldSession)}".`
+    $.prompt.submit({ text }).catch((err: unknown) => {
+      handedFrom = undefined
+      failed($, 'the seed prompt was rejected', `paste the brief path to carry on: ${p.briefPath}`)
+      return log($, `seed rejected ${String(err)}`)
+    })
+  } catch (err) {
+    await log($, `seed error ${String(err)}`)
+  }
+}
+
+// After the handoff's own /clear resolved. Seeds from pending while this handoff still owns it;
+// from expired when the lock was released as stuck and the /clear came within the late window.
+// Whatever already seeded (a classic.SessionStart, on an engine that delivers one) left nothing.
+async function seedAfterClear($: EngineInterface, oldSession: string) {
+  try {
+    if (pending?.oldSession === oldSession) return await seed($, pending)
+    const late = expired
+    if (late?.oldSession !== oldSession) return
+    if ((await $.clock.now()) - expiredAt > STUCK_MS) {
+      await log($, `clear after the late window session=${oldSession}: not seeded from its brief`)
+      if (expired === late) expired = undefined
+      return
+    }
+    if (expired !== late) return // a new handoff dropped it while the clock was read
+    await log($, `late clear session=${oldSession}: arrived after its lock was released; seeding from ${late.briefPath}`)
+    await seed($, late)
+  } catch (err) {
+    await log($, `seed error ${String(err)}`)
   }
 }
 
@@ -659,47 +729,13 @@ export const register: Register = (on, options) => {
       await log($, `clear after the late window session=${expired.oldSession}: not seeded from its brief`)
       expired = undefined
     }
-    if (e.source === 'clear' && !pending && !late && !inFlight && shown) hidePanel($)
+    // handedFrom: the handoff's own /clear already seeded (seedAfterClear) and its panel stays.
+    if (e.source === 'clear' && !pending && !late && !inFlight && !handedFrom && shown) hidePanel($)
     if (e.source !== 'clear') return r
     const p = pending ?? late
     if (!p) return r
     if (late) await log($, `late clear session=${late.oldSession}: arrived after its lock was released; seeding from ${late.briefPath}`)
-    pending = undefined
-    expired = undefined
-    try {
-      const newSession = await $.session.id()
-      seededSession = newSession
-      floor = undefined
-      unmeasured = 0
-      await $.store.set(`fired:${p.oldSession}`, `seeded:${newSession}`)
-      await log($, `seeding new=${newSession} from=${p.oldSession}`)
-      handedFrom = { session: p.oldSession, tokens: p.tokens, link: p.link, problem: p.problem }
-      steps($, [briefStep(p.problem), { mark: 'done', text: 'cleared' }, { mark: 'spin', text: 'starting the fresh session' }])
-      const own = await storedLineage($, p.oldSession)
-      const prior = own ? own.depth : 1
-      lineage = { from: p.oldSession, chain: p.chain, depth: prior !== undefined ? prior + 1 : undefined }
-      await $.store.set(`lineage:${newSession}`, lineage)
-      // The old brief learns where it went, and its chain's pages link forward.
-      try {
-        const old = parseBrief(await $.fs.read(p.briefPath) as string)
-        // viewer: the page link, read by the status line script for the session it handed off to.
-        await $.fs.write(p.briefPath, withHeader({ ...old.header, to: newSession, ...(p.link ? { viewer: p.link } : {}) }, old.body))
-        const briefDir = p.briefPath.replace(/\/[^/]+$/, '')
-        await viewer($, briefDir, `${briefDir}/pages`, p.oldSession)
-      } catch (err) {
-        await log($, `viewer forward link failed ${String(err)}`)
-      }
-      // One line on screen; the model reads the brief from disk. A full brief as the
-      // seed showed up as a wall of text the person never wrote.
-      const text = `${SEED_PREFIX} ${short(p.oldSession)}. The previous session hit its context limit and was cleared. Read the brief at ${p.briefPath} before doing anything else${p.link ? ` (readable copy: ${p.link})` : ''} and follow its Instructions section. Open your first reply with the line "↪ Handoff from session ${short(p.oldSession)}".`
-      $.prompt.submit({ text }).catch((err: unknown) => {
-        handedFrom = undefined
-        failed($, 'the seed prompt was rejected', `paste the brief path to carry on: ${p.briefPath}`)
-        return log($, `seed rejected ${String(err)}`)
-      })
-    } catch (err) {
-      await log($, `seed error ${String(err)}`)
-    }
+    await seed($, p)
     return r
   })
 }
